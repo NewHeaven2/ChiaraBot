@@ -31,13 +31,13 @@ import requests
 # FILTRI
 # ----------------------------------------------------------------------------
 MAX_AFFITTO = 9000
-MIN_MQ = 15
-MAX_MINUTI_UNI = 40
+MIN_MQ = 0                        # nessun limite di superficie
+MAX_MINUTI_UNI = 50
 SOLO_INTERI = True
 AVVISA_ANCHE_SE_DUBBIO = True     # avvisa anche se un dato manca (zona, data, foto)
 INGRESSO_DA = "2026-10-01"        # finestra di disponibilità richiesta
 INGRESSO_A = "2026-10-20"
-MIN_FOTO = 4                      # sotto questa soglia di solito c'è solo il palazzo
+MIN_FOTO = 3                      # sotto questa soglia di solito c'è solo il palazzo
 DATA_INDEFINITA_OK = True         # la data mancante non è un difetto: si concorda col proprietario
 
 STATE_FILE = Path(__file__).with_name("seen.json")
@@ -89,6 +89,11 @@ URL_BOSTADSPORTAL = [
     "https://bostadsportal.se/en/rental-apartments/sollentuna/",
     "https://bostadsportal.se/en/rental-apartments/lidingö/",
 ]
+URL_HOMII = [
+    "https://homii.se/hyra-bostad/stockholm",
+    "https://homii.se/hyra-bostad/solna",
+    "https://homii.se/hyra-bostad/sundbyberg",
+]
 URL_HOUSINGANYWHERE = [
     "https://housinganywhere.com/s/Stockholm--Sweden/apartment-for-rent",
     "https://housinganywhere.com/s/Stockholm--Sweden/studio-for-rent",
@@ -98,8 +103,9 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Accept-Language": "en-GB,en;q=0.9"})
 
 
-def scarica(url):
-    r = SESSION.get(url, timeout=45)
+def scarica(url, lingua=None):
+    r = SESSION.get(url, timeout=45,
+                    headers={"Accept-Language": lingua} if lingua else None)
     r.raise_for_status()
     return r.text
 
@@ -242,6 +248,55 @@ def arricchisci_bostadsportal(a):
 
 
 # ----------------------------------------------------------------------------
+# HOMII
+# ----------------------------------------------------------------------------
+MESI_SV = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "maj": "05",
+           "jun": "06", "jul": "07", "aug": "08", "sep": "09", "okt": "10",
+           "nov": "11", "dec": "12"}
+
+
+def _data_sv(testo):
+    m = re.match(r"(\d{1,2}) (\w{3})\w*\.? (\d{4})", testo)
+    if not m:
+        return None
+    g, mese, anno = m.groups()
+    mm = MESI_SV.get(mese.lower()[:3])
+    return f"{anno}-{mm}-{int(g):02d}" if mm else None
+
+
+def parse_homii(page):
+    out = []
+    for card in re.split(r'(?=<a href="/soka-bostad/annonser/)', page)[1:]:
+        mid = re.search(r"/soka-bostad/annonser/([0-9a-f-]{36})", card)
+        testo_card = re.sub(r"<!--.*?-->|<[^>]+>", "", card)
+        mpr = (re.search(r"(\d{1,3}[ \u00a0]\d{3})\s*kr/m", testo_card)
+               or re.search(r"\b(\d{4,5})\s*kr/m", testo_card))
+        if not (mid and mpr):
+            continue
+        testo = htmllib.unescape(re.sub(r"<!--.*?-->|<[^>]+>", "", card)).strip()
+        mmq = re.search(r"(\d+)\s*m²", testo)
+        mrum = re.search(r"(\d+)[\d,.]*\s*rum", testo)
+        mdata = re.search(r"(\d{1,2} \w{3,}\.? \d{4})", testo)
+        mzona = re.search(r"(?:Lägenhet|Hus|Rum)([A-ZÅÄÖ][^0-9]{2,40}?)\d+\s*rum", testo)
+        out.append({
+            "id": f"homii-{mid.group(1)[:12]}",
+            "fonte": "Homii",
+            "url": f"https://homii.se/soka-bostad/annonser/{mid.group(1)}",
+            "titolo": ("room in " if re.search(r"\bRum\b(?!\s*\d)", testo) and
+                       not re.search(r"\bLägenhet\b", testo) else "") + testo[:90],
+            "zona": (mzona.group(1).strip() if mzona else "Stoccolma"),
+            "prezzo": int(re.sub(r"\D", "", mpr.group(1))),
+            "mq": int(mmq.group(1)) if mmq else None,
+            "stanze": int(mrum.group(1)) if mrum else None,
+            "extra": "subaffitto",
+            "data": "",
+            "ingresso": _data_sv(mdata.group(1)) if mdata else None,
+            "foto": None,
+        })
+    return out
+
+
+# ----------------------------------------------------------------------------
 # VALUTAZIONE
 # ----------------------------------------------------------------------------
 def minuti_stimati(zona):
@@ -270,6 +325,8 @@ def valuta(a):
         ok = a["mq"] >= MIN_MQ
         check.append((ok, f"{a['mq']} m²"))
         passa &= ok
+    elif MIN_MQ <= 0:
+        check.append((True, "Superficie non indicata (nessun limite)"))
     else:
         check.append((None, "Superficie non indicata"))
 
@@ -290,7 +347,7 @@ def valuta(a):
         check.append((None, "Data di ingresso non indicata"))
 
     foto = a.get("foto")
-    if foto is None:
+    if foto is None:  # HousingAnywhere e Homii non espongono il conteggio
         check.append((None, "Numero di foto sconosciuto"))
     else:
         ok = foto >= MIN_FOTO
@@ -362,10 +419,11 @@ def giro(silenzioso_al_primo_giro=True):
     except Exception as e:
         errori.append(f"Qasa: {e}")
 
-    for url in URL_BOSTADSPORTAL + URL_HOUSINGANYWHERE:
+    for url in URL_BOSTADSPORTAL + URL_HOMII + URL_HOUSINGANYWHERE:
         try:
-            page = scarica(url)
+            page = scarica(url, "sv-SE" if "homii" in url else None)
             annunci += (parse_bostadsportal(page) if "bostadsportal" in url
+                        else parse_homii(page) if "homii" in url
                         else parse_housinganywhere(page))
         except Exception as e:
             errori.append(f"{url.split('/')[2]}: {e}")
@@ -396,7 +454,7 @@ def giro(silenzioso_al_primo_giro=True):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
-    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--test", l action="store_true")
     args = ap.parse_args()
     while True:
         giro(silenzioso_al_primo_giro=not args.test)
