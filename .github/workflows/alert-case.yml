@@ -1,0 +1,47 @@
+# .github/workflows/alert-case.yml
+# Fa girare il bot ogni 15 minuti su GitHub Actions (gratis per repo pubbliche
+# e con 2000 minuti/mese incluse per quelle private).
+#
+# Prima di usarlo:
+#   1. crea una repo con dentro stockholm_bot.py e questo file in .github/workflows/
+#   2. Settings -> Secrets and variables -> Actions -> New repository secret
+#      aggiungi TG_TOKEN e TG_CHAT
+
+name: Alert case Stoccolma
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # permette di lanciarlo a mano dal sito
+
+permissions:
+  contents: write           # serve per salvare seen.json tra un giro e l'altro
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: alert-case
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Controlla i portali
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: python stockholm_bot.py
+
+      - name: Salva gli annunci già visti
+        run: |
+          git config user.name "alert-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "aggiorna annunci visti"
+          git push
