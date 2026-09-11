@@ -34,7 +34,11 @@ MAX_AFFITTO = 9000
 MIN_MQ = 15
 MAX_MINUTI_UNI = 40
 SOLO_INTERI = True
-AVVISA_ANCHE_SE_DUBBIO = True     # avvisa anche se la zona non è in tabella
+AVVISA_ANCHE_SE_DUBBIO = True     # avvisa anche se un dato manca (zona, data, foto)
+INGRESSO_DA = "2026-10-01"        # finestra di disponibilità richiesta
+INGRESSO_A = "2026-10-20"
+MIN_FOTO = 4                      # sotto questa soglia di solito c'è solo il palazzo
+DATA_INDEFINITA_OK = True         # la data mancante non è un difetto: si concorda col proprietario
 
 STATE_FILE = Path(__file__).with_name("seen.json")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -62,7 +66,9 @@ TEMPI_ZONA = {
     "täby": 40, "vallentuna": 50, "upplands väsby": 45, "sollentuna kommun": 38,
     "haninge": 55, "huddinge": 45, "skogås": 50, "norsborg": 50, "tumba": 60,
     "märsta": 55, "södertälje": 70, "botkyrka": 50, "tyresö": 45, "värmdö": 55,
-    "sigtuna": 60, "nynäshamn": 80, "uppsala": 60,
+    "sigtuna": 60, "nynäshamn": 80, "uppsala": 60, "nykvarn": 75,
+    "åkersberga": 55, "vårby": 50, "segeltorp": 45, "bro": 60, "kungsängen": 55,
+    "gustavsberg": 55, "österåker": 55, "ekerö": 50, "rönninge": 55, "salem": 55,
 }
 
 PAROLE_STANZA = ("private room", "shared room", "room in", "rum i", "delat rum",
@@ -102,15 +108,18 @@ def scarica(url):
 # QASA — API GraphQL pubblica (nessun anti-bot, molto più affidabile dell'HTML)
 # ----------------------------------------------------------------------------
 QASA_QUERY = """
-query($aree: [ID!], $max: Int, $after: String) {
+query($aree: [ID!], $max: Int, $after: String, $da: DateTime, $a: DateTime) {
   homeSearch(searchParams: {areaIdentifier: $aree, maxRent: $max,
-                            homeType: [apartment]}) {
+                            homeType: [apartment],
+                            moveInEarliest: $da, moveInLatest: $a}) {
     filterHomes(first: 50, after: $after) {
       totalCount
       pageInfo { hasNextPage endCursor }
       nodes {
         id rent squareMeters roomCount shared firsthand
         rentalType publishedAt
+        duration { startOptimal }
+        uploads { id }
         location { locality route }
       }
     }
@@ -124,7 +133,8 @@ def fetch_qasa():
     for _ in range(QASA_PAGINE):
         r = SESSION.post(QASA_API, json={
             "query": QASA_QUERY,
-            "variables": {"aree": QASA_AREE, "max": MAX_AFFITTO, "after": cursor},
+            "variables": {"aree": QASA_AREE, "max": MAX_AFFITTO, "after": cursor,
+                          "da": INGRESSO_DA, "a": INGRESSO_A},
         }, timeout=45)
         r.raise_for_status()
         data = r.json()
@@ -149,6 +159,8 @@ def fetch_qasa():
                           else "subaffitto") +
                          (", affitto breve" if n.get("rentalType") == "vacation" else ""),
                 "data": (n.get("publishedAt") or "")[:10],
+                "ingresso": ((n.get("duration") or {}).get("startOptimal") or "")[:10] or None,
+                "foto": len(n.get("uploads") or []),
             })
         if not conn["pageInfo"]["hasNextPage"]:
             break
@@ -180,7 +192,7 @@ def parse_bostadsportal(page, base="https://bostadsportal.se"):
             "prezzo": int(re.sub(r"\D", "", prezzo)),
             "mq": int(mq.group(1)) if mq else None,
             "stanze": int(st.group(1)) if st else None,
-            "extra": "", "data": "",
+            "extra": "", "data": "", "ingresso": None, "foto": None,
         })
     return out
 
@@ -206,8 +218,27 @@ def parse_housinganywhere(page):
             "zona": htmllib.unescape(zona).strip(),
             "prezzo": int(prezzo.replace(",", "")),
             "mq": None, "stanze": None, "extra": "arredato, no deposito", "data": "",
+            "ingresso": None, "foto": None,
         })
     return out
+
+
+def arricchisci_bostadsportal(a):
+    """Apre la scheda dell'annuncio per leggere data di ingresso e numero di foto."""
+    try:
+        page = scarica(a["url"])
+    except Exception:
+        return a
+    m = re.search(r'available_from\\?": ?\\?"(\d{4}-\d{2}-\d{2})', page)
+    if m:
+        a["ingresso"] = m.group(1)
+    m = re.search(r'\\?"images\\?": ?\[(.*?)\]', page, re.S)
+    if m:
+        blocco = m.group(1)
+        totali = blocco.count('"url"')
+        piante = blocco.count('is_floor_plan\\?": ?true')
+        a["foto"] = max(totali - piante, 0)
+    return a
 
 
 # ----------------------------------------------------------------------------
@@ -227,6 +258,8 @@ def euro(n):
 
 
 def valuta(a):
+    """Ritorna (esito, check). esito: True = tutto ok, None = dati mancanti,
+    False = almeno un criterio non rispettato."""
     check, passa = [], True
 
     ok = a["prezzo"] <= MAX_AFFITTO
@@ -246,6 +279,24 @@ def valuta(a):
         check.append((intero, "Appartamento intero" if intero else "Sembra una stanza"))
         passa &= intero
 
+    ing = a.get("ingresso")
+    if ing:
+        ok = INGRESSO_DA <= ing <= INGRESSO_A
+        check.append((ok, f"Disponibile dal {ing}"))
+        passa &= ok
+    elif DATA_INDEFINITA_OK:
+        check.append((True, "Data da concordare col proprietario"))
+    else:
+        check.append((None, "Data di ingresso non indicata"))
+
+    foto = a.get("foto")
+    if foto is None:
+        check.append((None, "Numero di foto sconosciuto"))
+    else:
+        ok = foto >= MIN_FOTO
+        check.append((ok, f"{foto} foto" + ("" if ok else " — probabilmente solo esterni")))
+        passa &= ok
+
     minuti = minuti_stimati(a["zona"])
     if minuti is None:
         check.append((None, f"Zona «{a['zona']}» non in tabella — verifica su sl.se"))
@@ -256,14 +307,17 @@ def valuta(a):
         check.append((ok, f"~{minuti} min fino all'università (stima)"))
         passa &= ok
 
-    return passa, check
+    if not passa:
+        return False, check
+    return (None if any(o is None for o, _ in check) else True), check
 
 
 SIMBOLO = {True: "✅", False: "❌", None: "❓"}
 
 
-def messaggio(a, check, tutto_ok):
-    r = [f"{'🏠' if tutto_ok else '⚠️'} <b>Nuovo annuncio — {a['fonte']}</b>", ""]
+def messaggio(a, check, esito):
+    icona = {True: "🏠", None: "🔎", False: "⚠️"}[esito]
+    r = [f"{icona} <b>Nuovo annuncio — {a['fonte']}</b>", ""]
     descr = []
     if a["stanze"]:
         descr.append(f"{a['stanze']} locali")
@@ -277,8 +331,10 @@ def messaggio(a, check, tutto_ok):
     if a.get("data"):
         r.append(f"<i>pubblicato il {a['data']}</i>")
     r += ["", "<b>Filtri:</b>"] + [f"{SIMBOLO[ok]} {t}" for ok, t in check]
-    r += ["", "Soddisfa tutti i criteri." if tutto_ok
-          else "Non rispetta tutti i criteri, ma ci va vicino.",
+    finale = {True: "Soddisfa tutti i criteri.",
+              None: "Promettente, ma alcuni dati vanno verificati.",
+              False: "Non rispetta tutti i criteri, ma ci va vicino."}[esito]
+    r += ["", finale,
           f'<a href="{a["url"]}">Apri l\'annuncio</a>']
     return "\n".join(r)
 
@@ -320,11 +376,15 @@ def giro(silenzioso_al_primo_giro=True):
         if a["id"] in visti:
             continue
         visti.add(a["id"])
-        passa, check = valuta(a)
+        if a["fonte"] == "BostadsPortal" and a["prezzo"] <= MAX_AFFITTO:
+            arricchisci_bostadsportal(a)
+            time.sleep(1)
+        esito, check = valuta(a)
         quasi = (a["prezzo"] <= MAX_AFFITTO and
                  sum(1 for ok, _ in check if ok is False) <= 1)
-        if (passa or (AVVISA_ANCHE_SE_DUBBIO and quasi)) and not primo:
-            invia(messaggio(a, check, passa))
+        manda = esito is True or (AVVISA_ANCHE_SE_DUBBIO and (esito is None or quasi))
+        if manda and not primo:
+            invia(messaggio(a, check, esito))
             nuovi += 1
 
     STATE_FILE.write_text(json.dumps(sorted(visti)))
