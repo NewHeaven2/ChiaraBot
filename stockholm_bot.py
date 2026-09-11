@@ -41,6 +41,8 @@ MIN_FOTO = 3                      # sotto questa soglia di solito c'è solo il p
 DATA_INDEFINITA_OK = True         # la data mancante non è un difetto: si concorda col proprietario
 
 STATE_FILE = Path(__file__).with_name("seen.json")
+STATO_FILE = Path(__file__).with_name("stato.json")
+RIEPILOGO_OGNI_MINUTI = 60        # ogni quanto dire "nessun nuovo annuncio"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
@@ -409,6 +411,19 @@ def invia(testo):
         print(f"[!] Telegram: {e}", file=sys.stderr)
 
 
+def carica_stato():
+    if STATO_FILE.exists():
+        try:
+            return json.loads(STATO_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def salva_stato(st):
+    STATO_FILE.write_text(json.dumps(st))
+
+
 def giro(silenzioso_al_primo_giro=True):
     visti = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
     primo = not visti and silenzioso_al_primo_giro
@@ -446,6 +461,20 @@ def giro(silenzioso_al_primo_giro=True):
             nuovi += 1
 
     STATE_FILE.write_text(json.dumps(sorted(visti)))
+
+    # riepilogo orario: parte solo se in quell'ora non è arrivato nessun alert
+    stato = carica_stato()
+    adesso = time.time()
+    ultimo = stato.get("ultimo_messaggio", 0)
+    if nuovi:
+        stato["ultimo_messaggio"] = adesso      # il timer riparte da qui
+    elif not primo and adesso - ultimo >= RIEPILOGO_OGNI_MINUTI * 60:
+        invia("🔕 <b>Ricerca effettuata</b>\n"
+              f"Nessun nuovo annuncio nell'ultima ora.\n"
+              f"<i>{len(annunci)} annunci controllati su "
+              f"{len(set(a['fonte'] for a in annunci))} portali.</i>")
+        stato["ultimo_messaggio"] = adesso
+    salva_stato(stato)
     print(f"{time.strftime('%H:%M')} — {len(annunci)} annunci letti, {nuovi} alert"
           + (" (primo giro: solo indicizzazione)" if primo else "")
           + ("  |  errori: " + "; ".join(errori) if errori else ""))
@@ -454,7 +483,7 @@ def giro(silenzioso_al_primo_giro=True):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
-    ap.add_argument("--test", l action="store_true")
+    ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
     while True:
         giro(silenzioso_al_primo_giro=not args.test)
