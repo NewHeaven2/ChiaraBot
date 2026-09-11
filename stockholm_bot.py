@@ -42,7 +42,7 @@ DATA_INDEFINITA_OK = True         # la data mancante non è un difetto: si conco
 
 STATE_FILE = Path(__file__).with_name("seen.json")
 STATO_FILE = Path(__file__).with_name("stato.json")
-RIEPILOGO_OGNI_MINUTI = 60        # ogni quanto dire "nessun nuovo annuncio"
+RIEPILOGO_OGNI_MINUTI = 60        # ogni quanto dire "nessun nuovo annuncio"; 0 = mai
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
@@ -468,7 +468,8 @@ def giro(silenzioso_al_primo_giro=True):
     ultimo = stato.get("ultimo_messaggio", 0)
     if nuovi:
         stato["ultimo_messaggio"] = adesso      # il timer riparte da qui
-    elif not primo and adesso - ultimo >= RIEPILOGO_OGNI_MINUTI * 60:
+    elif (not primo and RIEPILOGO_OGNI_MINUTI > 0
+          and adesso - ultimo >= RIEPILOGO_OGNI_MINUTI * 60):
         invia("🔕 <b>Ricerca effettuata</b>\n"
               f"Nessun nuovo annuncio nell'ultima ora.\n"
               f"<i>{len(annunci)} annunci controllati su "
