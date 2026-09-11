@@ -157,7 +157,7 @@ def fetch_qasa():
             out.append({
                 "id": f"qasa-{n['id']}",
                 "fonte": "Qasa",
-                "url": f"https://qasa.com/se/sv/home/{n['id']}",
+                "url": f"https://qasa.com/se/en/home/{n['id']}",
                 "titolo": f"{n.get('roomCount') or '?'} locali, {n.get('squareMeters') or '?'} m²",
                 "zona": zona or "Stoccolma",
                 "prezzo": n["rent"],
