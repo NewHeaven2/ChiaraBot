@@ -1,28 +1,29 @@
 # .github/workflows/alert-case.yml
-# Fa girare il bot ogni 15 minuti su GitHub Actions (gratis per repo pubbliche
-# e con 2000 minuti/mese incluse per quelle private).
 #
-# Prima di usarlo:
-#   1. crea una repo con dentro stockholm_bot.py e questo file in .github/workflows/
-#   2. Settings -> Secrets and variables -> Actions -> New repository secret
-#      aggiungi TG_TOKEN e TG_CHAT
+# GitHub avvia i cron programmati in modo inaffidabile: con "ogni 15 minuti"
+# molte esecuzioni vengono saltate. Qui parte UNA corsa all'ora (i cron orari
+# sono molto più affidabili) e dentro quella corsa il controllo viene ripetuto
+# quattro volte, a distanza di 15 minuti. Se un'ora venisse comunque saltata,
+# quella successiva recupera da sola.
 
 name: Alert case Stoccolma
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:        # permette di lanciarlo a mano dal sito
+    - cron: "3 * * * *"     # ogni ora al minuto 3
+  workflow_dispatch:
 
 permissions:
-  contents: write           # serve per salvare seen.json tra un giro e l'altro
+  contents: write
+
+concurrency:
+  group: alert-case
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    concurrency:
-      group: alert-case
-      cancel-in-progress: false
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -32,18 +33,24 @@ jobs:
 
       - run: pip install requests
 
-      - name: Controlla i portali
+      - name: Controlla i portali ogni 15 minuti per un'ora
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
-        run: python stockholm_bot.py
-
-      - name: Salva stato e annunci già visti
         run: |
           git config user.name "alert-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add -A seen.json stato.json
-          git diff --staged --quiet && exit 0
-          git commit -m "aggiorna annunci visti"
-          git pull --rebase --autostash
-          git push
+          for i in 1 2 3 4; do
+            echo "::group::Controllo $i di 4"
+            python stockholm_bot.py || echo "giro $i fallito, continuo"
+
+            git add -A seen.json stato.json
+            if ! git diff --staged --quiet; then
+              git commit -m "aggiorna annunci visti (giro $i)"
+              git pull --rebase --autostash || true
+              git push || echo "push fallito, riprovo al giro successivo"
+            fi
+            echo "::endgroup::"
+
+            if [ "$i" -lt 4 ]; then sleep 900; fi
+          done
