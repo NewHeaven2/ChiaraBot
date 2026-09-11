@@ -38,6 +38,7 @@ AVVISA_ANCHE_SE_DUBBIO = True     # avvisa anche se un dato manca (zona, data, f
 INGRESSO_DA = "2026-10-01"        # finestra di disponibilità richiesta
 INGRESSO_A = "2026-10-20"
 MIN_FOTO = 3                      # sotto questa soglia di solito c'è solo il palazzo
+SOLO_ARREDATI = True              # solo appartamenti già arredati
 DATA_INDEFINITA_OK = True         # la data mancante non è un difetto: si concorda col proprietario
 
 STATE_FILE = Path(__file__).with_name("seen.json")
@@ -116,9 +117,10 @@ def scarica(url, lingua=None):
 # QASA — API GraphQL pubblica (nessun anti-bot, molto più affidabile dell'HTML)
 # ----------------------------------------------------------------------------
 QASA_QUERY = """
-query($aree: [ID!], $max: Int, $after: String, $da: DateTime, $a: DateTime) {
+query($aree: [ID!], $max: Int, $after: String, $da: DateTime, $a: DateTime,
+      $arredato: Boolean) {
   homeSearch(searchParams: {areaIdentifier: $aree, maxRent: $max,
-                            homeType: [apartment],
+                            homeType: [apartment], furniture: $arredato,
                             moveInEarliest: $da, moveInLatest: $a}) {
     filterHomes(first: 50, after: $after) {
       totalCount
@@ -142,7 +144,8 @@ def fetch_qasa():
         r = SESSION.post(QASA_API, json={
             "query": QASA_QUERY,
             "variables": {"aree": QASA_AREE, "max": MAX_AFFITTO, "after": cursor,
-                          "da": INGRESSO_DA, "a": INGRESSO_A},
+                          "da": INGRESSO_DA, "a": INGRESSO_A,
+                          "arredato": True if SOLO_ARREDATI else None},
         }, timeout=45)
         r.raise_for_status()
         data = r.json()
@@ -169,6 +172,7 @@ def fetch_qasa():
                 "data": (n.get("publishedAt") or "")[:10],
                 "ingresso": ((n.get("duration") or {}).get("startOptimal") or "")[:10] or None,
                 "foto": len(n.get("uploads") or []),
+                "arredato": True if SOLO_ARREDATI else None,
             })
         if not conn["pageInfo"]["hasNextPage"]:
             break
@@ -201,6 +205,7 @@ def parse_bostadsportal(page, base="https://bostadsportal.se"):
             "mq": int(mq.group(1)) if mq else None,
             "stanze": int(st.group(1)) if st else None,
             "extra": "", "data": "", "ingresso": None, "foto": None,
+            "arredato": None,
         })
     return out
 
@@ -226,7 +231,7 @@ def parse_housinganywhere(page):
             "zona": htmllib.unescape(zona).strip(),
             "prezzo": int(prezzo.replace(",", "")),
             "mq": None, "stanze": None, "extra": "arredato, no deposito", "data": "",
-            "ingresso": None, "foto": None,
+            "ingresso": None, "foto": None, "arredato": True,
         })
     return out
 
@@ -240,6 +245,13 @@ def arricchisci_bostadsportal(a):
     m = re.search(r'available_from\\?": ?\\?"(\d{4}-\d{2}-\d{2})', page)
     if m:
         a["ingresso"] = m.group(1)
+    mf = re.search(r">Furnished</span></div><div[^>]*><span[^>]*>([^<]+)<", page)
+    if mf:
+        valore = mf.group(1).strip().lower()
+        if valore in ("yes", "ja"):
+            a["arredato"] = True
+        elif valore in ("no", "nej"):
+            a["arredato"] = False
     m = re.search(r'\\?"images\\?": ?\[(.*?)\]', page, re.S)
     if m:
         blocco = m.group(1)
@@ -294,6 +306,7 @@ def parse_homii(page):
             "data": "",
             "ingresso": _data_sv(mdata.group(1)) if mdata else None,
             "foto": None,
+            "arredato": True if re.search(r"möblerad|furnished", testo, re.I) else None,
         })
     return out
 
@@ -355,6 +368,16 @@ def valuta(a):
         ok = foto >= MIN_FOTO
         check.append((ok, f"{foto} foto" + ("" if ok else " — probabilmente solo esterni")))
         passa &= ok
+
+    if SOLO_ARREDATI:
+        arr = a.get("arredato")
+        if arr is True:
+            check.append((True, "Arredato"))
+        elif arr is False:
+            check.append((False, "Non arredato"))
+            passa = False
+        else:
+            check.append((None, "Arredamento non dichiarato"))
 
     minuti = minuti_stimati(a["zona"])
     if minuti is None:
